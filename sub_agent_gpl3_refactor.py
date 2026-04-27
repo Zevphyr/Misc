@@ -1,6 +1,6 @@
 """
 title: Sub Agent
-version: 1.0.0
+version: 1.1.0
 license: GPL-3.0-or-later
 required_open_webui_version: 0.9.0
 description: Run autonomous, tool-heavy tasks in isolated sub-agent contexts.
@@ -1545,6 +1545,134 @@ async def execute_tool_call(
     return {"tool_call_id": call_id, "content": result}
 
 
+def tool_call_function_name(tool_call: dict) -> str:
+    """Return the exposed function name for a normalized tool_call."""
+    return str(as_dict(tool_call.get("function")).get("name") or "")
+
+
+def split_parallelizable_tool_calls(
+    tool_calls: list[dict],
+    *,
+    excluded_names: set[str],
+    max_parallel: int,
+) -> tuple[list[tuple[int, dict]], list[tuple[int, dict]]]:
+    """Split one assistant tool-call batch into parallel-safe and sequential calls.
+
+    Multiple tool calls emitted in a single assistant message are normally
+    independent under the function-calling protocol. We still keep an explicit
+    exclusion list for tools that often have visible side effects or mutate
+    shared state, so this optimization does not turn writes into races.
+    """
+    parallel: list[tuple[int, dict]] = []
+    sequential: list[tuple[int, dict]] = []
+    for index, call in enumerate(tool_calls):
+        name = tool_call_function_name(call)
+        if name in excluded_names or (max_parallel > 0 and len(parallel) >= max_parallel):
+            sequential.append((index, call))
+        else:
+            parallel.append((index, call))
+    return parallel, sequential
+
+
+async def execute_tool_call_batch(
+    *,
+    tool_calls: list[dict],
+    tools: dict[str, dict],
+    extra_params: dict,
+    event_emitter: Optional[Callable[[dict], Any]],
+    allow_literal_arg_fallback: bool,
+    tool_timeout_seconds: int,
+    enable_parallel_tool_calls: bool,
+    max_parallel_tool_calls: int,
+    parallel_tool_call_excluded_names: set[str],
+) -> list[dict[str, str]]:
+    """Execute one assistant tool-call batch and return results in API order.
+
+    This is the internal replacement for the standalone Parallel Tools helper.
+    It is not exposed to the model as a top-level tool, so it avoids a second
+    overlapping orchestration surface. When parallel execution is disabled or
+    unsafe for a call name, behavior falls back to the original sequential path.
+    """
+    if not tool_calls:
+        return []
+
+    async def run_one(call: dict, message_snapshot: list[dict]) -> dict[str, str]:
+        return await execute_tool_call(
+            tool_call=call,
+            tools=tools,
+            extra_params={**extra_params, "__messages__": message_snapshot},
+            event_emitter=event_emitter,
+            allow_literal_arg_fallback=allow_literal_arg_fallback,
+            tool_timeout_seconds=tool_timeout_seconds,
+        )
+
+    if not enable_parallel_tool_calls or len(tool_calls) <= 1:
+        results: list[dict[str, str]] = []
+        rolling_messages = list(extra_params.get("__messages__", []))
+        for call in tool_calls:
+            result = await run_one(call, rolling_messages)
+            results.append(result)
+            rolling_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": result.get("tool_call_id", str(uuid.uuid4())),
+                    "content": result.get("content", ""),
+                }
+            )
+        return results
+
+    parallel_calls, sequential_calls = split_parallelizable_tool_calls(
+        tool_calls,
+        excluded_names=parallel_tool_call_excluded_names,
+        max_parallel=max_parallel_tool_calls,
+    )
+
+    indexed_results: dict[int, dict[str, str]] = {}
+    base_snapshot = list(extra_params.get("__messages__", []))
+
+    if len(parallel_calls) > 1:
+        gathered = await asyncio.gather(
+            *(run_one(call, base_snapshot) for _, call in parallel_calls),
+            return_exceptions=True,
+        )
+        for (index, call), item in zip(parallel_calls, gathered):
+            call_name = tool_call_function_name(call) or "tool"
+            if isinstance(item, BaseException):
+                indexed_results[index] = {
+                    "tool_call_id": str(call.get("id") or uuid.uuid4()),
+                    "content": f"Error executing tool '{call_name}': {item}",
+                }
+            else:
+                indexed_results[index] = item
+    elif len(parallel_calls) == 1:
+        index, call = parallel_calls[0]
+        indexed_results[index] = await run_one(call, base_snapshot)
+
+    rolling_messages = list(base_snapshot)
+    for index in sorted(indexed_results):
+        prior = indexed_results[index]
+        rolling_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": prior.get("tool_call_id", str(uuid.uuid4())),
+                "content": prior.get("content", ""),
+            }
+        )
+
+    for index, call in sequential_calls:
+        result = await run_one(call, rolling_messages)
+        indexed_results[index] = result
+        rolling_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": result.get("tool_call_id", str(uuid.uuid4())),
+                "content": result.get("content", ""),
+            }
+        )
+
+    return [indexed_results[index] for index in range(len(tool_calls))]
+
+
 async def run_sub_agent_loop(
     *,
     request: Request,
@@ -1564,6 +1692,9 @@ async def run_sub_agent_loop(
     tool_timeout_seconds: int,
     show_tool_args_in_status: bool,
     show_tool_results_in_status: bool,
+    enable_parallel_tool_calls: bool,
+    max_parallel_tool_calls: int,
+    parallel_tool_call_excluded_names: set[str],
 ) -> str:
     current = list(messages)
 
@@ -1619,6 +1750,14 @@ async def run_sub_agent_loop(
 
         current.append({"role": "assistant", "content": str(content or ""), "tool_calls": tool_calls})
 
+        if enable_parallel_tool_calls and len(tool_calls) > 1:
+            names = [tool_call_function_name(call) or "tool" for call in tool_calls]
+            await emit_status(
+                event_emitter,
+                f"[Step {iteration}] Executing {len(tool_calls)} tool calls with internal parallel fan-out where safe: {', '.join(names)}",
+                limit=status_limit_chars,
+            )
+
         for tool_call in tool_calls:
             func = as_dict(tool_call.get("function"))
             if show_tool_args_in_status:
@@ -1628,14 +1767,19 @@ async def run_sub_agent_loop(
                     limit=status_limit_chars,
                 )
 
-            result = await execute_tool_call(
-                tool_call=tool_call,
-                tools=tools,
-                extra_params={**extra_params, "__messages__": current},
-                event_emitter=event_emitter,
-                allow_literal_arg_fallback=allow_literal_arg_fallback,
-                tool_timeout_seconds=tool_timeout_seconds,
-            )
+        batch_results = await execute_tool_call_batch(
+            tool_calls=tool_calls,
+            tools=tools,
+            extra_params={**extra_params, "__messages__": current},
+            event_emitter=event_emitter,
+            allow_literal_arg_fallback=allow_literal_arg_fallback,
+            tool_timeout_seconds=tool_timeout_seconds,
+            enable_parallel_tool_calls=enable_parallel_tool_calls,
+            max_parallel_tool_calls=max_parallel_tool_calls,
+            parallel_tool_call_excluded_names=parallel_tool_call_excluded_names,
+        )
+
+        for result in batch_results:
             result_content = truncate_text(result.get("content", ""), max_tool_result_chars)
             if show_tool_results_in_status:
                 await emit_status(
@@ -1702,6 +1846,35 @@ class Tools:
             description=(
                 "Load tools once for parallel tasks. Faster and preserves previous behavior. "
                 "Disable for maximum isolation with stateful custom tools."
+            ),
+        )
+        ENABLE_PARALLEL_TOOL_CALLS: bool = Field(
+            default=True,
+            description=(
+                "When the sub-agent model emits multiple tool calls in one assistant turn, "
+                "run independent calls concurrently instead of sequentially. This replaces the "
+                "separate Parallel Tools tool without exposing another model-facing tool."
+            ),
+        )
+        MAX_PARALLEL_TOOL_CALLS: int = Field(
+            default=8,
+            ge=1,
+            le=50,
+            description="Maximum tool calls from one assistant turn to fan out concurrently.",
+        )
+        PARALLEL_TOOL_CALL_EXCLUDED_NAMES: str = Field(
+            default=(
+                "run_command,write_file,replace_file_content,"
+                "generate_image,edit_image,"
+                "add_memory,replace_memory_content,delete_memory,"
+                "write_note,replace_note_content,"
+                "create_tasks,update_task,"
+                "create_automation,update_automation,toggle_automation,delete_automation,"
+                "create_calendar_event,update_calendar_event,delete_calendar_event"
+            ),
+            description=(
+                "Comma-separated tool function names that should remain sequential even when "
+                "multiple tool calls are emitted in one turn. Keep write/state-changing tools here."
             ),
         )
 
@@ -2068,6 +2241,9 @@ class Tools:
                     tool_timeout_seconds=self.valves.TOOL_TIMEOUT_SECONDS,
                     show_tool_args_in_status=self.valves.SHOW_TOOL_ARGS_IN_STATUS,
                     show_tool_results_in_status=self.valves.SHOW_TOOL_RESULTS_IN_STATUS,
+                    enable_parallel_tool_calls=self.valves.ENABLE_PARALLEL_TOOL_CALLS,
+                    max_parallel_tool_calls=self.valves.MAX_PARALLEL_TOOL_CALLS,
+                    parallel_tool_call_excluded_names=set(split_csv(self.valves.PARALLEL_TOOL_CALL_EXCLUDED_NAMES)),
                 )
                 return {"description": task["description"], "result": result}
             except Exception as exc:
