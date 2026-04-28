@@ -1,9 +1,9 @@
 """
-title: Image Search & Inline Display (DDGS)
+title: Image Search & Inline Display
 author: Local
-version: 0.4.0
-requirements: ddgs,requests
-description: Search for an image with DDGS, return inline Markdown, optionally cache it in Open WebUI temporarily, and clean expired cached files.
+version: 0.5.0
+requirements: requests
+description: Search for an image through SearXNG or DDGS, return inline Markdown, optionally cache it in Open WebUI temporarily, and clean expired cached files.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import html
 import ipaddress
 import json
 import mimetypes
+import os
 import re
 import socket
 import tempfile
@@ -23,6 +24,7 @@ from typing import Any, Optional
 from urllib.parse import (
     parse_qsl,
     quote,
+    quote_plus,
     urlencode,
     urljoin,
     urlparse,
@@ -99,8 +101,87 @@ class Tools:
             description="Verify TLS certificates for outbound HTTP requests.",
         )
         user_agent: str = Field(
-            default="OpenWebUI-ImageTool/0.4",
+            default="OpenWebUI-ImageTool/0.5",
             description="HTTP User-Agent header for remote fetches.",
+        )
+
+        # Search provider behavior
+        search_provider: str = Field(
+            default="auto",
+            description=(
+                "Search backend to use. 'auto' uses SearXNG when a SearXNG URL is configured, "
+                "then falls back to DDGS. 'searxng' keeps search traffic centralized through "
+                "your own SearXNG instance. 'ddgs' uses DDGS directly from the Open WebUI process."
+            ),
+            json_schema_extra={
+                "input": {"type": "select", "options": ["auto", "searxng", "ddgs"]}
+            },
+        )
+        fallback_to_ddgs_on_searxng_failure: bool = Field(
+            default=False,
+            description=(
+                "When search_provider='searxng', fall back to DDGS if SearXNG fails. "
+                "Keep false if you want to avoid direct DDGS traffic from this tool."
+            ),
+        )
+
+        # SearXNG behavior
+        searxng_query_url: str = Field(
+            default="",
+            description=(
+                "SearXNG search URL. Supports Open WebUI-style '<query>' placeholders, "
+                "for example 'http://searxng:8080/search?q=<query>'. If blank, the tool "
+                "checks SEARXNG_QUERY_URL and then searxng_base_url."
+            ),
+        )
+        searxng_base_url: str = Field(
+            default="",
+            description=(
+                "SearXNG base URL used when searxng_query_url is blank, e.g. "
+                "'http://searxng:8080'. The tool appends '/search'."
+            ),
+        )
+        searxng_categories: str = Field(
+            default="images",
+            description="SearXNG categories to request. Use 'images' for image search.",
+        )
+        searxng_engines: str = Field(
+            default="",
+            description="Optional comma-separated SearXNG engines. Blank uses the instance defaults.",
+        )
+        searxng_language: str = Field(
+            default="all",
+            description="SearXNG search language, e.g. all, en, de, fr.",
+        )
+        searxng_safesearch: str = Field(
+            default="1",
+            description="SearXNG safesearch: 0=off, 1=moderate, 2=strict.",
+            json_schema_extra={
+                "input": {"type": "select", "options": ["0", "1", "2"]}
+            },
+        )
+        searxng_time_range: str = Field(
+            default="",
+            description="Optional SearXNG time range: day, month, year, or blank.",
+        )
+        searxng_image_proxy: bool = Field(
+            default=True,
+            description=(
+                "Ask SearXNG to proxy image result URLs when the instance supports it. "
+                "This can reduce direct client exposure to third-party image hosts."
+            ),
+        )
+        searxng_timeout_seconds: int = Field(
+            default=15,
+            description="Timeout for SearXNG API requests.",
+        )
+        allow_internal_search_service_urls: bool = Field(
+            default=True,
+            description=(
+                "Allow the configured search provider URL to point at a private/container "
+                "network address. This is needed for local SearXNG, but only admins should "
+                "control the configured URL."
+            ),
         )
 
         # DDGS behavior
@@ -350,7 +431,7 @@ class Tools:
 
     def _headers(self, accept: str = "*/*") -> dict[str, str]:
         return {
-            "User-Agent": self.valves.user_agent.strip() or "OpenWebUI-ImageTool/0.4",
+            "User-Agent": self.valves.user_agent.strip() or "OpenWebUI-ImageTool/0.5",
             "Accept": accept,
         }
 
@@ -363,6 +444,163 @@ class Tools:
         if not proxy:
             return None
         return {"http": proxy, "https": proxy}
+
+    def _safe_search_provider(self) -> str:
+        provider = str(self.valves.search_provider or "auto").strip().lower()
+        return provider if provider in {"auto", "searxng", "ddgs"} else "auto"
+
+    def _searxng_configured(self) -> bool:
+        return bool(
+            str(self.valves.searxng_query_url or "").strip()
+            or str(self.valves.searxng_base_url or "").strip()
+            or os.environ.get("SEARXNG_QUERY_URL", "").strip()
+            or os.environ.get("SEARXNG_BASE_URL", "").strip()
+        )
+
+    def _searxng_endpoint_template(self) -> str:
+        configured = str(self.valves.searxng_query_url or "").strip()
+        configured = configured or os.environ.get("SEARXNG_QUERY_URL", "").strip()
+        if configured:
+            return configured
+
+        base = str(self.valves.searxng_base_url or "").strip()
+        base = base or os.environ.get("SEARXNG_BASE_URL", "").strip()
+        if not base:
+            return ""
+
+        return base.rstrip("/") + "/search"
+
+    def _searxng_public_base_url(self) -> str:
+        # Optional escape hatch for deployments where the search URL is an
+        # internal container name but returned image-proxy URLs need a browser-
+        # reachable base. This intentionally reads only an environment variable
+        # to avoid adding another Open WebUI valve unless needed.
+        return os.environ.get("SEARXNG_PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+    def _search_service_url_allowed(self, url: str) -> tuple[bool, str]:
+        try:
+            parsed = urlparse(url)
+        except Exception as e:
+            return False, f"Search provider URL parse failed: {type(e).__name__}: {e}"
+
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return False, f"Search provider URL scheme is not allowed: {parsed.scheme or '(missing)'}"
+        if not parsed.hostname:
+            return False, "Search provider URL is missing a host."
+        if parsed.username or parsed.password:
+            return False, "Search provider URL userinfo is not allowed."
+
+        if self.valves.allow_internal_search_service_urls:
+            return True, "ok"
+
+        privateish, detail = self._host_resolves_to_private_address(parsed.hostname)
+        if privateish:
+            return False, f"Search provider URL host resolves to a blocked address ({detail})."
+        return True, "ok"
+
+    def _append_missing_query_params(
+        self,
+        url: str,
+        params: dict[str, str],
+    ) -> str:
+        parts = urlsplit(url)
+        existing = parse_qsl(parts.query, keep_blank_values=True)
+        existing_names = {key for key, _ in existing}
+        combined = list(existing)
+
+        for key, value in params.items():
+            if value == "" or key in existing_names:
+                continue
+            combined.append((key, value))
+
+        return urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                parts.path,
+                urlencode(combined, doseq=True),
+                parts.fragment,
+            )
+        )
+
+    def _searxng_search_url(self, query: str) -> str:
+        template = self._searxng_endpoint_template()
+        if not template:
+            raise RuntimeError(
+                "SearXNG is selected but no SearXNG URL is configured. Set "
+                "searxng_query_url, searxng_base_url, SEARXNG_QUERY_URL, or SEARXNG_BASE_URL."
+            )
+
+        if "<query>" in template:
+            url = template.replace("<query>", quote_plus(query))
+            has_query_placeholder = True
+        else:
+            url = template
+            has_query_placeholder = False
+
+        safe = str(self.valves.searxng_safesearch or "1").strip()
+        if safe not in {"0", "1", "2"}:
+            safe = "1"
+
+        params: dict[str, str] = {
+            "format": "json",
+            "categories": str(self.valves.searxng_categories or "images").strip() or "images",
+            "language": str(self.valves.searxng_language or "all").strip() or "all",
+            "safesearch": safe,
+            "image_proxy": "true" if self.valves.searxng_image_proxy else "false",
+        }
+
+        if not has_query_placeholder:
+            params["q"] = query
+
+        engines = str(self.valves.searxng_engines or "").strip()
+        if engines:
+            params["engines"] = engines
+
+        time_range = str(self.valves.searxng_time_range or "").strip()
+        if time_range:
+            params["time_range"] = time_range
+
+        return self._append_missing_query_params(url, params)
+
+    def _url_origin(self, url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            pass
+        return ""
+
+    def _make_absolute_result_url(self, value: str, response_url: str) -> str:
+        value = str(value or "").strip()
+        if not value:
+            return ""
+
+        public_base = self._searxng_public_base_url()
+        if public_base and value.startswith("/"):
+            return urljoin(public_base + "/", value.lstrip("/"))
+
+        base = self._url_origin(response_url) or response_url
+        return urljoin(base.rstrip("/") + "/", value)
+
+    def _configured_searxng_origins(self) -> set[str]:
+        origins: set[str] = set()
+        for value in [
+            self._searxng_endpoint_template(),
+            str(self.valves.searxng_base_url or "").strip(),
+            os.environ.get("SEARXNG_BASE_URL", "").strip(),
+            os.environ.get("SEARXNG_PUBLIC_BASE_URL", "").strip(),
+        ]:
+            if value:
+                origin = self._url_origin(value)
+                if origin:
+                    origins.add(origin.lower())
+        return origins
+
+    def _is_configured_searxng_origin(self, url: str) -> bool:
+        origin = self._url_origin(url).lower()
+        return bool(origin and origin in self._configured_searxng_origins())
 
     def _base_url_from_request(self, __request__=None) -> str:
         if __request__ is None:
@@ -682,6 +920,14 @@ class Tools:
 
         privateish, detail = self._host_resolves_to_private_address(parsed.hostname)
         if privateish:
+            # SearXNG image_proxy URLs may legitimately point to an internal
+            # container-only hostname. Allow only the explicitly configured
+            # SearXNG origin; keep all other private-network fetch targets blocked.
+            if (
+                self.valves.allow_internal_search_service_urls
+                and self._is_configured_searxng_origin(url)
+            ):
+                return True, "ok"
             return False, f"URL host resolves to a blocked address ({detail})."
 
         return True, "ok"
@@ -817,8 +1063,38 @@ class Tools:
         query: str,
         debug: Optional[dict[str, Any]] = None,
     ) -> list[ImageCandidate]:
+        provider = self._safe_search_provider()
+
+        if provider == "searxng":
+            try:
+                return self._search_searxng_image_candidates(query, debug=debug)
+            except Exception:
+                if self.valves.fallback_to_ddgs_on_searxng_failure:
+                    return self._search_ddgs_image_candidates(query, debug=debug)
+                raise
+
+        if provider == "ddgs":
+            return self._search_ddgs_image_candidates(query, debug=debug)
+
+        # auto: prefer SearXNG only when it is explicitly configured. This avoids
+        # silently trying a guessed container hostname on installations without
+        # SearXNG while still letting Open WebUI/SearXNG deployments opt in cleanly.
+        if self._searxng_configured():
+            try:
+                return self._search_searxng_image_candidates(query, debug=debug)
+            except Exception:
+                return self._search_ddgs_image_candidates(query, debug=debug)
+
+        return self._search_ddgs_image_candidates(query, debug=debug)
+
+    def _search_ddgs_image_candidates(
+        self,
+        query: str,
+        debug: Optional[dict[str, Any]] = None,
+    ) -> list[ImageCandidate]:
         kwargs = self._ddgs_kwargs(query)
         search_debug: dict[str, Any] = {
+            "provider": "ddgs",
             "query": query,
             "kwargs": kwargs,
             "raw_result_count": None,
@@ -887,6 +1163,180 @@ class Tools:
             )
 
         normalized.sort(key=lambda candidate: candidate.score, reverse=True)
+
+        search_debug["normalized_result_count"] = len(normalized)
+        search_debug["top_candidates"] = [
+            self._candidate_for_debug(candidate) for candidate in normalized[:5]
+        ]
+
+        if debug is not None and self.valves.debug_mode:
+            debug["search"].append(search_debug)
+
+        return normalized
+
+    def _parse_resolution(self, value: Any) -> tuple[int, int]:
+        raw = str(value or "")
+        match = re.search(r"(\d{2,5})\s*[x×]\s*(\d{2,5})", raw, flags=re.I)
+        if not match:
+            return 0, 0
+        return self._safe_int(match.group(1), 0), self._safe_int(match.group(2), 0)
+
+    def _candidate_from_searxng_item(
+        self,
+        item: dict[str, Any],
+        query: str,
+        response_url: str,
+    ) -> Optional[ImageCandidate]:
+        image_url = (
+            str(
+                item.get("img_src")
+                or item.get("image")
+                or item.get("image_url")
+                or item.get("thumbnail_src")
+                or item.get("thumbnail")
+                or ""
+            )
+            .strip()
+        )
+        thumbnail_url = (
+            str(
+                item.get("thumbnail")
+                or item.get("thumbnail_src")
+                or item.get("thumb")
+                or ""
+            )
+            .strip()
+        )
+        page_url = str(item.get("url") or item.get("href") or item.get("source_url") or "").strip()
+
+        image_url = self._make_absolute_result_url(image_url, response_url)
+        thumbnail_url = self._make_absolute_result_url(thumbnail_url, response_url)
+        page_url = self._make_absolute_result_url(page_url, response_url)
+
+        if not image_url and self.valves.allow_thumbnail_fallback:
+            image_url = thumbnail_url
+
+        if not page_url:
+            page_url = image_url
+
+        if not image_url or not page_url:
+            return None
+
+        title = str(item.get("title") or item.get("content") or query).strip() or query
+
+        engines = item.get("engines")
+        if isinstance(engines, list):
+            source = ", ".join(str(engine) for engine in engines if str(engine).strip())
+        else:
+            source = str(item.get("engine") or item.get("source") or "SearXNG").strip()
+
+        width = self._safe_int(item.get("width"), 0)
+        height = self._safe_int(item.get("height"), 0)
+
+        if not width or not height:
+            width, height = self._parse_resolution(
+                item.get("resolution")
+                or item.get("img_format")
+                or item.get("metadata")
+                or ""
+            )
+
+        score = self._score_result(
+            title=title,
+            image_url=image_url,
+            thumbnail_url=thumbnail_url,
+            page_url=page_url,
+            source=source,
+            width=width,
+            height=height,
+            query=query,
+        )
+
+        if score <= -10_000:
+            return None
+
+        return ImageCandidate(
+            title=title,
+            image_url=image_url,
+            thumbnail_url=thumbnail_url,
+            page_url=page_url,
+            source=source,
+            width=width,
+            height=height,
+            score=score,
+        )
+
+    def _search_searxng_image_candidates(
+        self,
+        query: str,
+        debug: Optional[dict[str, Any]] = None,
+    ) -> list[ImageCandidate]:
+        url = self._searxng_search_url(query)
+        ok, reason = self._search_service_url_allowed(url)
+        search_debug: dict[str, Any] = {
+            "provider": "searxng",
+            "query": query,
+            "url": self._sanitize_url_for_debug(url),
+            "raw_result_count": None,
+            "normalized_result_count": None,
+            "exception": None,
+            "top_candidates": [],
+        }
+
+        if not ok:
+            search_debug["exception"] = reason
+            if debug is not None and self.valves.debug_mode:
+                debug["search"].append(search_debug)
+            raise RuntimeError(reason)
+
+        try:
+            with requests.get(
+                url,
+                headers=self._headers(accept="application/json,*/*;q=0.8"),
+                timeout=self._bounded_positive_int(self.valves.searxng_timeout_seconds, 15),
+                allow_redirects=True,
+                verify=self.valves.verify_ssl,
+            ) as resp:
+                resp.raise_for_status()
+                data = resp.json()
+                response_url = resp.url
+        except Exception as e:
+            search_debug["exception"] = f"{type(e).__name__}: {e}"
+            if debug is not None and self.valves.debug_mode:
+                debug["search"].append(search_debug)
+            raise RuntimeError(
+                f"SearXNG image search failed for query={query!r}: {type(e).__name__}: {e}"
+            ) from e
+
+        if not isinstance(data, dict):
+            search_debug["exception"] = "SearXNG response was not a JSON object."
+            if debug is not None and self.valves.debug_mode:
+                debug["search"].append(search_debug)
+            raise RuntimeError("SearXNG response was not a JSON object.")
+
+        results = data.get("results") or []
+        if not isinstance(results, list):
+            results = []
+
+        search_debug["raw_result_count"] = len(results)
+        normalized: list[ImageCandidate] = []
+
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            candidate = self._candidate_from_searxng_item(
+                item=item,
+                query=query,
+                response_url=response_url,
+            )
+            if candidate is not None:
+                normalized.append(candidate)
+
+        normalized.sort(key=lambda candidate: candidate.score, reverse=True)
+
+        limit = self._bounded_positive_int(self.valves.search_result_limit, 12)
+        if len(normalized) > limit:
+            normalized = normalized[:limit]
 
         search_debug["normalized_result_count"] = len(normalized)
         search_debug["top_candidates"] = [
@@ -1417,7 +1867,7 @@ class Tools:
         else:
             debug["cleanup"] = {"deleted": 0, "failed": 0, "remaining": -1, "skipped": 1}
 
-        await self._emit(__event_emitter__, "Searching DDGS for image results...", False)
+        await self._emit(__event_emitter__, "Searching for image results...", False)
 
         candidate, image_url, selected_via, search_exception = self._select_candidate(
             query=query,
@@ -1633,7 +2083,7 @@ class Tools:
         __event_emitter__=None,
     ) -> str:
         """
-        Inspect DDGS image candidates and return a debug report without rendering or caching.
+        Inspect image candidates and return a debug report without rendering or caching.
         """
 
         query = str(query or "").strip()
@@ -1641,7 +2091,7 @@ class Tools:
             return "Please provide a non-empty image search query."
 
         debug = self._new_debug_report(query=query, mode="debug", result_index=1)
-        await self._emit(__event_emitter__, "Inspecting DDGS image candidates...", False)
+        await self._emit(__event_emitter__, "Inspecting image candidates...", False)
 
         try:
             variants = self._query_variants(query)
